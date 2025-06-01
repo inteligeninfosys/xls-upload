@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-backend-service
+spec:
+  selector:
+    app: nodejs-backend
+  ports:
+    - protocol: TCP
+      port: 80             # internal service port
+      targetPort: 3000     # your Node.js app's container port
+      nodePort: 30070      # externally exposed port on the node
+  type: NodePort
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+type: Opaque
+stringData:
+  user: ecol
+  password: L#TTc011
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-config
+data:
+  connectString: "copkprdcont3-scan.co-opbank.co.ke:1559/ECOLLECT"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xls-upload
+  labels:
+    app: xls-upload
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: xls-upload
+  template:
+    metadata:
+      labels:
+        app: xls-upload
+    spec:
+      containers:
+        - name: xls-upload
+          image: inteligeninfosys/xls-upload:1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: ORACLE_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: user
+            - name: ORACLE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: password
+            - name: ORACLE_DB_CONNECT_STRING
+              valueFrom:
+                configMapKeyRef:
+                  name: db-config
+                  key: connectString
+          resources:
+            requests:
+              cpu: "100m"     # guarantees 0.1 CPU
+              memory: "128Mi" # minimum memory reserved
+              ephemeral-storage: "20Mi"
+            limits:
+              cpu: "500m"     # max 0.5 CPU
+              memory: "512Mi" # max memory allowed
+              ephemeral-storage: "1Gi"

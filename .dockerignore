@@ -1,0 +1,35 @@
+# Node modules (we'll install them in Docker)
+node_modules
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+logs
+*.log
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# Tests and coverage (optional)
+coverage
+*.test.js
+
+# Git
+.git
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile
+
+# Misc build artifacts
+dist
+tmp
