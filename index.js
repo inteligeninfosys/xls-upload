@@ -41,6 +41,25 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
 
         const owner = req.headers['username'] || 'anonymous';
 
+        const uploadType =
+            String(req.body.uploadType || '')
+                .trim()
+                .toUpperCase();
+
+        const allowedUploadTypes = [
+            'LOAN',
+            'CREDIT_CARD'
+        ];
+
+        if (!allowedUploadTypes.includes(uploadType)) {
+
+            safeUnlink(filePath);
+
+            return res.status(400).send(
+                'Invalid upload type. Select either LOAN or CREDIT_CARD.'
+            );
+        }
+
         /*
          * --------------------------------------------------
          * Read Excel
@@ -180,9 +199,36 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
         connection = await oracledb.getConnection(dbConfig);
 
         const results = [];
-        const accnumberRegex = /^[0-9]{14}$/;
-        const cifRegex = /^[0-9]{7}$/;
-        const validationErrors = [];
+        let accnumberRegex;
+        let accnumberValidationMessage;
+
+        let cifRegex;
+        let cifValidationMessage;
+
+        if (uploadType === 'LOAN') {
+
+            accnumberRegex = /^[0-9]{14}$/;
+
+            accnumberValidationMessage =
+                'accnumber must contain exactly 14 digits (0-9) for Loan uploads';
+
+            cifRegex = /^[0-9]{9}$/;
+
+            cifValidationMessage =
+                'cif must contain exactly 9 digits (0-9) for Loan uploads';
+
+        } else {
+
+            accnumberRegex = /^[0-9]{5,14}$/;
+
+            accnumberValidationMessage =
+                'accnumber must contain between 5 and 14 digits (0-9) for Credit Card uploads';
+
+            cifRegex = /^[0-9]{5,14}$/;
+
+            cifValidationMessage =
+                'cif must contain between 5 and 14 digits (0-9) for Credit Card uploads';
+        }
         /*
          * --------------------------------------------------
          * Process individual rows
@@ -225,7 +271,7 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
              * Row validation
              * --------------------------------------------------
              */
-            if (!accnumber || !cif || !notemade) {
+            /*if (!accnumber || !cif || !notemade) {
 
                 const missing = [];
 
@@ -251,6 +297,55 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
                     Status: 'Failed',
                     Message:
                         `Missing required value(s): ${missing.join(', ')}`
+                });
+
+                continue;
+            }*/
+            const validationErrors = [];
+
+            /*
+             * Required fields
+             */
+            if (!accnumber) {
+                validationErrors.push(
+                    'accnumber is required'
+                );
+            } else if (!accnumberRegex.test(accnumber)) {
+                validationErrors.push(
+                    accnumberValidationMessage
+                );
+            }
+
+            if (!cif) {
+                validationErrors.push(
+                    'cif is required'
+                );
+            } else if (!cifRegex.test(cif)) {
+                validationErrors.push(
+                    cifValidationMessage
+                );
+            }
+
+            if (!notemade) {
+                validationErrors.push(
+                    'notemade is required'
+                );
+            }
+
+            /*
+             * If validation fails, don't attempt Oracle INSERT.
+             */
+            if (validationErrors.length > 0) {
+
+                results.push({
+                    Row: excelRowNumber,
+                    accnumber: accnumber,
+                    cif: cif,
+                    notemade: notemade,
+                    owner: owner,
+                    notesrc: 'uploaded a note',
+                    Status: 'Failed',
+                    Message: validationErrors.join('; ')
                 });
 
                 continue;
@@ -286,6 +381,7 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
 
                 results.push({
                     Row: excelRowNumber,
+                    UploadType: uploadType,
                     accnumber: accnumber,
                     cif: cif,
                     notemade: notemade,
@@ -367,6 +463,7 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
          */
         const reportHeaders = [
             'Row',
+            'UploadType',
             'accnumber',
             'cif',
             'notemade',

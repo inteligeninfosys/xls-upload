@@ -22,4 +22,4 @@ EXPOSE 3000
 
 CMD ["node", "index.js"]
 
-# docker build -t inteligeninfosys/xls-upload:1.4 .
+# docker build -t inteligeninfosys/xls-upload:1.5 .
