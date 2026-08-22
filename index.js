@@ -18,9 +18,19 @@ const dbConfig = {
 };
 
 
+
 app.post('/uploadxls', upload.single('file'), async (req, res) => {
     let connection = null;
     let filePath = null;
+
+    const uploadType = String(
+        req.body.uploadType || ''
+    ).trim().toUpperCase();
+
+    const allowPartial =
+        String(
+            req.body.allowPartial || ''
+        ).toLowerCase() === 'true';
 
     const safeUnlink = (file) => {
         try {
@@ -196,9 +206,13 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
             )
         `;
 
-        connection = await oracledb.getConnection(dbConfig);
 
-        const results = [];
+        /*
+        * --------------------------------------------------
+        * Validation rules
+        * --------------------------------------------------
+        */
+
         let accnumberRegex;
         let accnumberValidationMessage;
 
@@ -217,9 +231,9 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
             cifValidationMessage =
                 'cif must contain exactly 9 digits (0-9) for Loan uploads';
 
-        } else {
+        } else if (uploadType === 'CREDIT_CARD') {
 
-            accnumberRegex = /^[0-9]{5,14}$/;
+            accnumberRegex = /^[0-9]{5,20}$/;
 
             accnumberValidationMessage =
                 'accnumber must contain between 5 and 14 digits (0-9) for Credit Card uploads';
@@ -228,26 +242,36 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
 
             cifValidationMessage =
                 'cif must contain between 5 and 14 digits (0-9) for Credit Card uploads';
+        } else {
+
+            safeUnlink(filePath);
+
+            return res.status(400).send(
+                'Invalid upload type. Select either LOAN or CREDIT_CARD.'
+            );
         }
         /*
-         * --------------------------------------------------
-         * Process individual rows
-         * --------------------------------------------------
-         */
+        * --------------------------------------------------
+        * PHASE 1:
+        * Validate ALL Excel rows before touching Oracle
+        * --------------------------------------------------
+        */
+        const validRows = [];
+        const validationFailures = [];
+
+        console.log('[BulkNotes] Starting validation', {
+            file: req.file.originalname,
+            uploadType,
+            allowPartial,
+            owner,
+            rowsReceived: jsonData.length
+        });
+
         for (let i = 0; i < jsonData.length; i++) {
 
             const row = jsonData[i];
-
-            /*
-             * Excel row number:
-             * Row 1 = headers
-             * First data row = row 2
-             */
             const excelRowNumber = i + 2;
 
-            /*
-             * Keep the original Excel values for reporting.
-             */
             const accnumber =
                 row.accnumber !== null &&
                     row.accnumber !== undefined
@@ -266,161 +290,337 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
                     ? String(row.notemade).trim()
                     : '';
 
+
             /*
-             * --------------------------------------------------
-             * Row validation
-             * --------------------------------------------------
+             * Ignore completely blank rows.
              */
-            /*if (!accnumber || !cif || !notemade) {
+            if (!accnumber && !cif && !notemade) {
 
-                const missing = [];
-
-                if (!accnumber) {
-                    missing.push('accnumber');
-                }
-
-                if (!cif) {
-                    missing.push('cif');
-                }
-
-                if (!notemade) {
-                    missing.push('notemade');
-                }
-
-                results.push({
-                    Row: excelRowNumber,
-                    accnumber: accnumber,
-                    cif: cif,
-                    notemade: notemade,
-                    owner: owner,
-                    notesrc: 'uploaded a note',
-                    Status: 'Failed',
-                    Message:
-                        `Missing required value(s): ${missing.join(', ')}`
-                });
+                console.log(
+                    `[BulkNotes] Excel row ${excelRowNumber} ignored - blank row`
+                );
 
                 continue;
-            }*/
+            }
+
+
             const validationErrors = [];
 
+
             /*
-             * Required fields
+             * Account validation
              */
             if (!accnumber) {
+
                 validationErrors.push(
                     'accnumber is required'
                 );
+
             } else if (!accnumberRegex.test(accnumber)) {
+
                 validationErrors.push(
                     accnumberValidationMessage
                 );
             }
 
+
+            /*
+             * CIF validation
+             */
             if (!cif) {
+
                 validationErrors.push(
                     'cif is required'
                 );
+
             } else if (!cifRegex.test(cif)) {
+
                 validationErrors.push(
                     cifValidationMessage
                 );
             }
 
+
+            /*
+             * Note validation
+             */
             if (!notemade) {
+
                 validationErrors.push(
                     'notemade is required'
                 );
             }
 
+
             /*
-             * If validation fails, don't attempt Oracle INSERT.
+             * Invalid row
              */
             if (validationErrors.length > 0) {
 
-                results.push({
+                const failedRow = {
                     Row: excelRowNumber,
-                    accnumber: accnumber,
-                    cif: cif,
-                    notemade: notemade,
-                    owner: owner,
+                    UploadType: uploadType,
+                    accnumber,
+                    cif,
+                    notemade,
+                    owner,
                     notesrc: 'uploaded a note',
                     Status: 'Failed',
                     Message: validationErrors.join('; ')
-                });
+                };
+
+                validationFailures.push(failedRow);
+
+                console.warn(
+                    `[BulkNotes] Validation failed at Excel row ${excelRowNumber}`,
+                    {
+                        accnumber,
+                        cif,
+                        errors: validationErrors
+                    }
+                );
 
                 continue;
             }
 
+
             /*
-             * --------------------------------------------------
-             * Oracle bind variables
-             *
-             * THIS IS THE CIF -> CUSTNUMBER MAPPING
-             * --------------------------------------------------
+             * Valid row
              */
-            const bindRow = {
-                accnumber: accnumber,
-
-                // Excel CIF is stored in NOTEHIS.CUSTNUMBER
-                custnumber: cif,
-
-                notemade: notemade,
-                owner: owner,
-                notesrc: 'uploaded a note'
-            };
-
-            try {
-
-                await connection.execute(
-                    insertSQL,
-                    bindRow,
-                    {
-                        autoCommit: false
-                    }
-                );
-
-                results.push({
-                    Row: excelRowNumber,
-                    UploadType: uploadType,
-                    accnumber: accnumber,
-                    cif: cif,
-                    notemade: notemade,
-                    owner: owner,
-                    notesrc: 'uploaded a note',
-                    Status: 'Success',
-                    Message: ''
-                });
-
-            } catch (err) {
-
-                console.error(
-                    `Bulk notes insert failed at Excel row ${excelRowNumber}:`,
-                    err
-                );
-
-                results.push({
-                    Row: excelRowNumber,
-                    accnumber: accnumber,
-                    cif: cif,
-                    notemade: notemade,
-                    owner: owner,
-                    notesrc: 'uploaded a note',
-                    Status: 'Failed',
-                    Message: err.message
-                });
-            }
+            validRows.push({
+                Row: excelRowNumber,
+                UploadType: uploadType,
+                accnumber,
+                cif,
+                notemade
+            });
         }
 
         /*
-         * Commit successful records.
-         *
-         * Rows which failed are recorded in the report while
-         * successful rows are retained.
-         */
-        await connection.commit();
+        * --------------------------------------------------
+        * Pre-validation summary
+        * --------------------------------------------------
+        */
 
-        await connection.close();
-        connection = null;
+        const preValidationFailedCount =
+            validationFailures.length;
+
+        console.log('[BulkNotes] Validation completed', {
+            total: validRows.length + validationFailures.length,
+            valid: validRows.length,
+            failed: preValidationFailedCount,
+            allowPartial
+        });
+
+
+        /*
+        * Show actual failed rows when there are failures.
+        */
+        if (preValidationFailedCount > 0) {
+
+            console.warn(
+                '[BulkNotes] Rows failing pre-validation:',
+                validationFailures.map(row => ({
+                    Row: row.Row,
+                    accnumber: row.accnumber,
+                    cif: row.cif,
+                    Message: row.Message
+                }))
+            );
+        }
+
+        /*
+        * --------------------------------------------------
+        * If validation errors exist and user DID NOT
+        * approve partial processing, stop before Oracle.
+        * --------------------------------------------------
+        */
+
+        if (
+            preValidationFailedCount > 0 &&
+            !allowPartial
+        ) {
+
+            console.warn(
+                '[BulkNotes] Upload cancelled because partial upload was not approved',
+                {
+                    total:
+                        validRows.length +
+                        validationFailures.length,
+                    valid: validRows.length,
+                    failed: preValidationFailedCount,
+                    owner,
+                    uploadType
+                }
+            );
+
+            safeUnlink(filePath);
+
+            return res.status(422).send(
+                `${preValidationFailedCount} row(s) contain validation errors. ` +
+                `Partial upload was not approved. No records were inserted.`
+            );
+        }
+
+        /*
+        * --------------------------------------------------
+        * PHASE 2:
+        * User approved processing.
+        *
+        * Start results with the validation failures.
+        * --------------------------------------------------
+        */
+
+        const results = [
+            ...validationFailures
+        ];
+
+        /*
+        * No valid rows
+        */
+        if (validRows.length === 0) {
+
+            console.warn(
+                '[BulkNotes] No valid rows available for database processing.'
+            );
+
+        } else {
+            /*
+            * Only now connect to Oracle.
+            */
+            connection =
+                await oracledb.getConnection(
+                    dbConfig
+                );
+
+            console.log(
+                `[BulkNotes] Oracle connected. Processing ${validRows.length} valid row(s).`
+            );
+
+
+            /*
+            * --------------------------------------------------
+            * Insert valid rows
+            * --------------------------------------------------
+            */
+
+            for (const row of validRows) {
+
+                const bindRow = {
+
+                    accnumber:
+                        row.accnumber,
+
+                    /*
+                     * Excel CIF -> NOTEHIS.CUSTNUMBER
+                     */
+                    custnumber:
+                        row.cif,
+
+                    notemade:
+                        row.notemade,
+
+                    owner:
+                        owner,
+
+                    notesrc:
+                        'uploaded a note'
+                };
+
+
+                try {
+
+                    await connection.execute(
+                        insertSQL,
+                        bindRow,
+                        {
+                            autoCommit: false
+                        }
+                    );
+
+
+                    results.push({
+                        Row: row.Row,
+                        UploadType: uploadType,
+                        accnumber: row.accnumber,
+                        cif: row.cif,
+                        notemade: row.notemade,
+                        owner,
+                        notesrc: 'uploaded a note',
+                        Status: 'Success',
+                        Message: ''
+                    });
+
+
+                    console.log(
+                        `[BulkNotes] Row ${row.Row} inserted successfully`,
+                        {
+                            accnumber: row.accnumber,
+                            cif: row.cif
+                        }
+                    );
+
+
+                } catch (err) {
+
+                    /*
+                     * Database failure for THIS row.
+                     * Other valid rows continue.
+                     */
+                    results.push({
+                        Row: row.Row,
+                        UploadType: uploadType,
+                        accnumber: row.accnumber,
+                        cif: row.cif,
+                        notemade: row.notemade,
+                        owner,
+                        notesrc: 'uploaded a note',
+                        Status: 'Failed',
+                        Message: err.message
+                    });
+
+
+                    console.error(
+                        `[BulkNotes] Oracle insert failed at Excel row ${row.Row}`,
+                        {
+                            accnumber: row.accnumber,
+                            cif: row.cif,
+                            code: err.code,
+                            errorNum: err.errorNum,
+                            message: err.message,
+                            offset: err.offset
+                        }
+                    );
+                }
+            }
+
+            /*
+            * Commit all successful statements.
+            */
+            await connection.commit();
+
+            console.log(
+                '[BulkNotes] Oracle transaction committed.'
+            );
+
+
+            await connection.close();
+
+            connection = null;
+
+            console.log(
+                '[BulkNotes] Oracle connection closed.'
+            );
+        }
+
+        /*
+        * Keep report in original Excel row order.
+        */
+        results.sort(
+            (a, b) =>
+                a.Row - b.Row
+        );
+
 
         /*
          * --------------------------------------------------
@@ -575,26 +775,50 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
     } catch (err) {
 
         console.error(
-            'Bulk notes processing error:',
-            err
+            '[BulkNotes] Fatal upload processing error',
+            {
+                code: err.code,
+                errorNum: err.errorNum,
+                message: err.message,
+                offset: err.offset,
+                stack: err.stack
+            }
         );
 
         if (connection) {
+
             try {
+
                 await connection.rollback();
+
+                console.warn(
+                    '[BulkNotes] Oracle transaction rolled back.'
+                );
+
             } catch (rollbackErr) {
+
                 console.error(
-                    'Rollback error:',
-                    rollbackErr
+                    '[BulkNotes] Oracle rollback failed',
+                    {
+                        code: rollbackErr.code,
+                        message: rollbackErr.message
+                    }
                 );
             }
 
+
             try {
+
                 await connection.close();
+
             } catch (closeErr) {
+
                 console.error(
-                    'Oracle connection close error:',
-                    closeErr
+                    '[BulkNotes] Oracle connection close failed',
+                    {
+                        code: closeErr.code,
+                        message: closeErr.message
+                    }
                 );
             }
         }
@@ -602,7 +826,8 @@ app.post('/uploadxls', upload.single('file'), async (req, res) => {
         safeUnlink(filePath);
 
         if (!res.headersSent) {
-            res
+
+            return res
                 .status(500)
                 .send(
                     'Bulk notes upload failed due to an internal server error.'
